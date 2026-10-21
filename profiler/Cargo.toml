@@ -1,0 +1,9 @@
+[package]
+name = "openvm-profiler"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+object = { version = "0.36", default-features = false, features = ["read", "std"] }
+cpp_demangle = "0.4"
+rustc-demangle = "0.1"

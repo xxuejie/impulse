@@ -1,0 +1,49 @@
+[package]
+name = "impulse-runner"
+version = "0.1.0"
+edition = "2021"
+
+[profile.release]
+debug = 1
+codegen-units = 1
+lto = "fat"
+
+[features]
+# Pick exactly one via --features. Mutually exclusive (enforced in main.rs).
+default = ["softfloat"]
+softfloat = []
+zfinx  = ["dep:openvm-rv32f-transpiler", "dep:openvm-rv32f-circuit"]
+f      = ["dep:openvm-rv32f-transpiler", "dep:openvm-rv32f-circuit"]
+
+[dependencies]
+# OpenVM core from fork (includes profiling hook patch).
+openvm-circuit = { git = "https://github.com/xxuejie/openvm.git", rev = "2c97976209bdb06c994990581a3b64ab53d1e3f1", default-features = false, features = ["test-utils", "metrics"] }
+openvm-circuit-derive = { git = "https://github.com/xxuejie/openvm.git", rev = "2c97976209bdb06c994990581a3b64ab53d1e3f1" }
+openvm-instructions = { git = "https://github.com/xxuejie/openvm.git", rev = "2c97976209bdb06c994990581a3b64ab53d1e3f1" }
+openvm-transpiler = { git = "https://github.com/xxuejie/openvm.git", rev = "2c97976209bdb06c994990581a3b64ab53d1e3f1" }
+openvm-rv32im-transpiler = { git = "https://github.com/xxuejie/openvm.git", rev = "2c97976209bdb06c994990581a3b64ab53d1e3f1" }
+openvm-rv32im-circuit = { git = "https://github.com/xxuejie/openvm.git", rev = "2c97976209bdb06c994990581a3b64ab53d1e3f1", default-features = false }
+openvm-stark-backend = { git = "https://github.com/openvm-org/stark-backend.git", tag = "v2.0.0", default-features = false }
+openvm-cpu-backend = { git = "https://github.com/openvm-org/stark-backend.git", tag = "v2.0.0", default-features = false }
+
+# SHA-2 (always needed — guests hash their state into public values).
+openvm-sha2-transpiler = { git = "https://github.com/xxuejie/openvm.git", rev = "2c97976209bdb06c994990581a3b64ab53d1e3f1" }
+openvm-sha2-circuit = { git = "https://github.com/xxuejie/openvm.git", rev = "2c97976209bdb06c994990581a3b64ab53d1e3f1", default-features = false }
+
+# RISC-V F extension (zfinx / F mode only). From openvm-floating git.
+openvm-rv32f-transpiler = { git = "https://github.com/xxuejie/openvm-floating.git", rev = "115c21eb35180ce4d283dd336fd2416bdf5ff998", optional = true }
+openvm-rv32f-circuit = { git = "https://github.com/xxuejie/openvm-floating.git", rev = "115c21eb35180ce4d283dd336fd2416bdf5ff998", optional = true }
+
+# STARK backend (BabyBear / Poseidon2).
+openvm-stark-sdk = { git = "https://github.com/openvm-org/stark-backend.git", tag = "v2.0.0" }
+
+# Host-side helpers.
+eyre = "0.6"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+sha2 = "0.10"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+derive_more = { version = "2", features = ["from"] }
+openvm-profiler = { path = "../profiler" }
+bincode = "1"

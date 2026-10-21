@@ -1,0 +1,8 @@
+build/
+target/
+*.o
+*.a
+state_*.bin
+profile*.txt
+profile*.prof
+*_dump.txt

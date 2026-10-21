@@ -1,0 +1,75 @@
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  # Native-only determinism guard: fast (~5 min), no cross toolchain.
+  # Replays the committed golden session natively (headless) and checks
+  # the recorded hash + blob.
+  native-golden:
+    runs-on: ubuntu-latest
+    env:
+      CLANG: clang-22
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libgl-dev ninja-build
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/llvm.gpg
+          echo "deb [signed-by=/usr/share/keyrings/llvm.gpg] http://apt.llvm.org/noble/ llvm-toolchain-noble-22 main" | sudo tee /etc/apt/sources.list.d/llvm22.list
+          sudo apt-get update
+          sudo apt-get install -y clang-22 lld-22 llvm-22
+      - name: Build native playground
+        run: make -j$(nproc) build-native-playground
+      - name: Golden session native replay
+        run: |
+          cp tests/golden-session.bin build/session.bin
+          ./build/playground_native --replay build/session.bin --headless | tee replay.log
+          grep -q "replayed final hash: $(cat tests/golden-hash.txt)" replay.log
+          grep -q "MATCH — replay reproduces" replay.log
+
+  # Full guest round trip: cross deps (cached ~30-45 min cold) + runner +
+  # VM replay of the golden session. Proving is NOT run in CI (RAM).
+  # Toolchain matches the dev box (clang 22) — the pinned libc++ sources
+  # (22.1.8) do not build with Ubuntu's stock clang 18.
+  vm-golden:
+    runs-on: ubuntu-latest
+    env:
+      CLANG: clang-22
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libgl-dev ninja-build
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/llvm.gpg
+          echo "deb [signed-by=/usr/share/keyrings/llvm.gpg] http://apt.llvm.org/noble/ llvm-toolchain-noble-22 main" | sudo tee /etc/apt/sources.list.d/llvm22.list
+          sudo apt-get update
+          sudo apt-get install -y clang-22 lld-22 llvm-22
+      - name: Submodule fingerprint
+        id: submodules
+        run: echo "fp=$(git submodule status | sha256sum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - name: Cache cross deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps/musl/release
+            deps/libcxx/release-*
+            deps/builtins/build
+          key: deps-${{ runner.os }}-clang22-${{ steps.submodules.outputs.fp }}
+      - name: Cache Rust build (runner)
+        uses: Swatinem/rust-cache@v1
+        with:
+          workspaces: runner
+      - name: Golden session native + VM regression
+        run: make demo-regress
+      - name: Determinism matrix (quick set)
+        run: scripts/verify-matrix.sh
