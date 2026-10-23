@@ -155,11 +155,11 @@ prove-openvm: build-openvm
 # the library references. List is generated mechanically — do not
 # hand-maintain.
 JOLT_SRC := $(shell find $(JOLT)/Jolt -name '*.cpp' \
-	-not -path '$(JOLT)/Jolt/ObjectStream/*' \
-	-not -path '$(JOLT)/Jolt/Renderer/*' \
-	-not -path '$(JOLT)/Jolt/Compute/VK/*' \
-	-not -path '$(JOLT)/Jolt/Compute/DX12/*' \
-	-not -path '$(JOLT)/Jolt/Compute/MTL/*') \
+	! -path '$(JOLT)/Jolt/ObjectStream/*' \
+	! -path '$(JOLT)/Jolt/Renderer/*' \
+	! -path '$(JOLT)/Jolt/Compute/VK/*' \
+	! -path '$(JOLT)/Jolt/Compute/DX12/*' \
+	! -path '$(JOLT)/Jolt/Compute/MTL/*') \
 	$(JOLT)/Jolt/ObjectStream/SerializableObject.cpp
 # Determinism: normalize FP behavior so rv32im_zfinx and x86-64 agree
 # bit-for-bit (also set for the native reference build below). NDEBUG keeps
@@ -321,15 +321,16 @@ prove-openvm-pyramid: build-openvm-pyramid
 
 # --- M5: Live demo — play, verify, replay -----------------------------------
 # demo/playground.cpp is a dual-mode guest:
-#   native: interactive X11 window (demo/viewer.h). Play a minute, then
+#   native: interactive GLFW window (demo/viewer.h). Play a minute, then
 #           quit: the session — initial world dump + every command (the
 #           keys, resolved to quantized ops) + final state hash — is
 #           recorded in build/session.bin (+ .cmds.txt/.world0.txt
 #           sidecars, + _final.bin state blob).
-#   openvm: the session is baked into the ELF (xxd -i -> build/session_data.h);
-#           the guest rebuilds the world, verifies the initial world hash,
-#           replays every command at the exact step, and reveals the final
-#           state hash — printing whether it matches the recording.
+#   openvm: the session is baked into the ELF (scripts/bin2h.py ->
+#           build/session_data.h); the guest rebuilds the world, verifies
+#           the initial world hash, replays every command at the exact
+#           step, and reveals the final state hash — printing whether it
+#           matches the recording.
 #
 #   make demo-play    fire up the window and play (keys below); q ends
 #   make demo-verify  run the recording in OpenVM; prints hash MATCH/MISMATCH
@@ -365,11 +366,9 @@ build-native-playground: build/libJolt_native.a
 	$(CLANGXX) $(JOLT_PG_NATIVE_CXXFLAGS) $(GLFW_CFLAGS) demo/playground.cpp build/libJolt_native.a -o build/playground_native $(GLFW_LIBS)
 
 demo-play: build-native-playground
-	@if [ -z "$$DISPLAY" ]; then echo "impulse: no \$$DISPLAY — try: make demo-auto"; exit 1; fi
 	./build/playground_native --height $(DEMO_HEIGHT) --out $(DEMO_OUT)
 
 demo-replay: build-native-playground $(DEMO_OUT)
-	@if [ -z "$$DISPLAY" ]; then echo "impulse: no \$$DISPLAY"; exit 1; fi
 	./build/playground_native --replay $(DEMO_OUT)
 
 DEMO_STEPS ?= 360
@@ -380,7 +379,7 @@ $(DEMO_OUT):
 	@echo "impulse: $(DEMO_OUT) missing — record one first: make demo-play (or demo-auto)"; exit 1
 
 build/session_data.h: $(DEMO_OUT)
-	cd build && xxd -i session.bin > session_data.h
+	python3 scripts/bin2h.py build/session.bin build/session_data.h
 
 build-openvm-playground: $(MUSL_TARGET) $(BUILTINS_TARGET) $(LIBCXX_TARGET) $(RUNTIME_OBJS) build/libJolt.a build/session_data.h
 	$(CLANGXX) $(JOLT_CXXFLAGS) -I $(JOLT)/PerformanceTest -I build demo/playground.cpp -c -o build/playground.o
@@ -402,7 +401,7 @@ endif
 # changes, Jolt updates). Session: h=4, 180 steps, all four command types.
 demo-regress: build-native-playground
 	cp tests/golden-session.bin build/session.bin
-	./build/playground_native --replay build/session.bin --headless | tail -2
+	./build/playground_native --replay build/session.bin --headless | tail -n 2
 	$(MAKE) build-openvm-playground
 	cd runner && cargo build --release $(RUNNER_FEATURES)
 	./runner/target/release/impulse-runner build/playground > build/regress-vm.log 2>&1
@@ -492,5 +491,5 @@ clean:
 .PHONY: all build-openvm bench-openvm build-native run-native run-openvm prove-openvm \
 	build-openvm-jolt run-openvm-jolt build-native-jolt run-native-jolt \
 	build-native-pyramid run-native-pyramid build-openvm-pyramid run-openvm-pyramid prove-openvm-pyramid \
-	build-native-playground demo-play demo-replay demo-auto demo-verify demo-e2e demo-stats demo-prove \
+	build-native-playground demo-play demo-replay demo-auto demo-verify demo-e2e demo-stats demo-prove demo-regress \
 	build-openvm-playground clean
