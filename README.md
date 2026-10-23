@@ -28,8 +28,10 @@ Proving (CPU, this machine, verifier guest + streamed session):
 proving bounds PEAK MEMORY by segment size (~50 GB here, zram
 absorbs the oversubscription) while TIME scales ~linearly at
 ~57 s per 1M guest instructions — so longer sessions prove on a
-single box in linear time (a full 60 s gameplay session ≈ 178M
-instr ≈ 3 h; GPU provers remain the real-game path, ~2-7M instr/s).
+single box in linear time: a calm gameplay second ≈ 28M instr ≈
+27 min CPU, a chaotic one ≈ 178M ≈ 3 h, and the full 60 s human
+session (10.7B) is ~7 days — GPU provers remain the real-game
+path at ~2-7M instr/s.
 
 Proofs are persisted: `impulse-runner prove --input <session>` writes
 a ~2 MB artifact (verifying key + continuation proof, bincode) next
@@ -101,7 +103,9 @@ make demo-verify   # runs the recording through ONE GENERIC verifier
 make demo-replay   # watch the recording again in the window: the same
                     # actions auto-fire, the same pile results
 make demo-e2e      # headless round trip (no display): demo-auto + demo-verify
-make demo-prove    # tiny session + full zk proof (~2M instr, ~30 GB — free -g)
+make demo-prove    # tiny session + full zk proof (~2M instr, ~1 min /
+                    # ~28 GB; longer sessions: ~57 s per 1M instr, peak
+                    # memory bounded ~52 GB by segments — free -g)
 ```
 
 `DEMO_HEIGHT` (default 6) sizes the pyramid; `DEMO_STEPS`/`DEMO_SCRIPT`
