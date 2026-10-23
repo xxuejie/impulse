@@ -430,10 +430,10 @@ demo-stats: build-openvm-playground
 		| grep instructions_executed | sed 's/.*instructions_executed=//' > build/session.instr
 	python3 scripts/session-stats.py $(DEMO_OUT) $$(cat build/session.instr)
 
-# Provable session: ~2M guest instructions, measured 148 s / 28.8 GB peak
-# host RAM on the dev box (zram absorbs oversubscription) — check free -g.
-# The ball is fired at step 1 and still in flight; a session that runs to
-# the impact needs ~45+ steps ≈ 7M+ instr = GPU path or another host.
+# Provable session: ~2M guest instructions, ~1 min / ~28 GB peak host
+# RAM on the dev box. Continuation proving keeps peak memory bounded by
+# segment size (~52 GB here even at 6.2M instr, 3 segments) while time
+# scales ~57 s per 1M instructions — check free -g.
 demo-prove:
 	$(MAKE) demo-auto DEMO_HEIGHT=2 DEMO_STEPS=3 DEMO_SCRIPT="F:1:0:1"
 	$(MAKE) demo-verify PROVE=1

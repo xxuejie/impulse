@@ -22,11 +22,14 @@ JobSystemThreadPool 1–12), and the VM (rv32im_zfinx, single-threaded):
 | Pyramid h=4 (30 boxes) | 339,700,252 | `fcc59ef0...df97` |
 | Live demo (60 s human session, h=6, 160 cmds) | 10,708,033,015 | `1e23f3bd...57dc0` |
 
-Proving (CPU, this machine): hello = 10 s / 3.1 GB; pyramid h=2
-(1.59M instr) = 143 s / 28.3 GB; live-demo session (1.98M instr) =
-~148 s / ~28 GB. Economics: ~3.1 GB fixed + ~15 GB per 1M guest
-instructions — this box proves ≤ ~2M instruction guests; larger
-scenes execute but need a GPU path or another host to prove.
+Proving (CPU, this machine, verifier guest + streamed session):
+1.98M instr = 64 s / 27.3 GB (1 segment); 3.57M = 177 s / 51.4 GB
+(2 segments); 6.2M = 353 s / 52.9 GB (3 segments). Continuation
+proving bounds PEAK MEMORY by segment size (~50 GB here, zram
+absorbs the oversubscription) while TIME scales ~linearly at
+~57 s per 1M guest instructions — so longer sessions prove on a
+single box in linear time (a full 60 s gameplay session ≈ 178M
+instr ≈ 3 h; GPU provers remain the real-game path, ~2-7M instr/s).
 
 Proofs are persisted: `impulse-runner prove --input <session>` writes
 a ~2 MB artifact (verifying key + continuation proof, bincode) next
