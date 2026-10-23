@@ -1,30 +1,34 @@
 // impulse: native-only viewer for the live playground demo (demo/playground.cpp).
 //
-// A minimal GLX/X11 window rendering the Jolt scene with fixed-function
-// OpenGL (no external dependencies beyond libX11/libGL). Everything here
-// is display code: it may use any math it likes (host trig, doubles,
-// wall clock) because NONE of it touches the simulation or anything that
+// GLFW + fixed-function OpenGL: one code path for Linux, macOS and
+// Windows (macOS gets the legacy 2.1 context, which still supports the
+// whole fixed-function pipeline used here). Everything in this file is
+// display code: it may use any math it likes (host trig, doubles, wall
+// clock) because NONE of it touches the simulation or anything that
 // gets recorded — commands leave this file as fully quantized integers
 // (op, a, b) and are applied by the shared, deterministic sim code.
 //
-// Opcodes must match the session opcodes in demo/playground.cpp
-// (static_assert'ed there).
+// The HUD font is embedded (demo/hud_font.h) — no system font calls.
+//
+// Opcodes must match the session opcodes in demo/playground.cpp.
 
 #ifndef IMPULSE_VIEWER_H
 #define IMPULSE_VIEWER_H
 
 #ifndef OPENVM
 
-#include <X11/Xlib.h>
-#include <X11/Xutil.h>
-#include <X11/keysym.h>
-#include <X11/cursorfont.h>
+#include <GLFW/glfw3.h>
+#ifdef __APPLE__
+#include <OpenGL/gl.h> // legacy 2.1 fixed-function context
+#else
 #include <GL/gl.h>
-#include <GL/glx.h>
-#include <unistd.h>
-#include <time.h>
+#endif
+#include <stdio.h>
 #include <string.h>
 #include <stdint.h>
+#include <math.h>
+
+#include "hud_font.h"
 
 enum
 {
@@ -55,150 +59,51 @@ class PGViewer
 public:
 	static PGViewer* create(int inWidth, int inHeight, uint32_t inSceneHeight)
 	{
-		Display* dpy = XOpenDisplay(nullptr);
-		if (!dpy)
+		if (!glfwInit())
 			return nullptr;
 
-		int attribs[] = { GLX_RGBA, GLX_DOUBLEBUFFER, GLX_DEPTH_SIZE, 24,
-			GLX_RED_SIZE, 8, GLX_GREEN_SIZE, 8, GLX_BLUE_SIZE, 8, None };
-		XVisualInfo* vi = glXChooseVisual(dpy, DefaultScreen(dpy), attribs);
-		if (!vi)
+		// No version hints: macOS yields a legacy 2.1 context (full
+		// fixed-function), Linux/Windows a compatibility context.
+		GLFWwindow* win = glfwCreateWindow(inWidth, inHeight,
+			"impulse - live Jolt session (recorded for zkVM replay)", nullptr, nullptr);
+		if (!win)
 		{
-			XCloseDisplay(dpy);
+			glfwTerminate();
 			return nullptr;
 		}
-		GLXContext ctx = glXCreateContext(dpy, vi, nullptr, True);
-		if (!ctx)
-		{
-			XCloseDisplay(dpy);
-			return nullptr;
-		}
-
-		Window root = RootWindow(dpy, DefaultScreen(dpy));
-		Colormap cmap = XCreateColormap(dpy, root, vi->visual, AllocNone);
-		XSetWindowAttributes swa;
-		swa.colormap = cmap;
-		swa.border_pixel = 0;
-		swa.event_mask = KeyPressMask | KeyReleaseMask | ButtonPressMask
-			| ButtonReleaseMask | PointerMotionMask | StructureNotifyMask | ExposureMask
-			| FocusChangeMask;
-		Window win = XCreateWindow(dpy, root, 0, 0, inWidth, inHeight, 0, vi->depth,
-			InputOutput, vi->visual, CWColormap | CWEventMask | CWBorderPixel, &swa);
-		XStoreName(dpy, win, "impulse - live Jolt session (recorded for zkVM replay)");
-
-		Atom wm_delete = XInternAtom(dpy, "WM_DELETE_WINDOW", False);
-		XSetWMProtocols(dpy, win, &wm_delete, 1);
-		Cursor cursor = XCreateFontCursor(dpy, XC_crosshair);
-		XDefineCursor(dpy, win, cursor);
-		XMapRaised(dpy, win);
-		if (!glXMakeCurrent(dpy, win, ctx))
-		{
-			XCloseDisplay(dpy);
-			return nullptr;
-		}
+		glfwMakeContextCurrent(win);
+		glfwSwapInterval(1);
 
 		PGViewer* v = new PGViewer();
-		v->m_dpy = dpy;
 		v->m_win = win;
-		v->m_ctx = ctx;
-		v->m_cmap = cmap;
-		v->m_wm_delete = wm_delete;
-		v->m_w = inWidth;
-		v->m_h = inHeight;
+		glfwGetFramebufferSize(win, &v->m_w, &v->m_h);
 		v->m_target_y = inSceneHeight * 1.4f;
 		if (v->m_target_y > 26.0f)
 			v->m_target_y = 26.0f;
 		v->m_dist = inSceneHeight * 3.0f + 26.0f;
 		v->init_gl();
+		glfwSetWindowUserPointer(win, v);
+		glfwSetKeyCallback(win, key_cb);
+		glfwSetFramebufferSizeCallback(win, fb_size_cb);
+		glfwSetMouseButtonCallback(win, mouse_cb);
+		glfwSetCursorPosCallback(win, cursor_cb);
+		glfwSetScrollCallback(win, scroll_cb);
+		glfwSetWindowFocusCallback(win, focus_cb);
+		glfwSetWindowCloseCallback(win, close_cb);
 		return v;
 	}
 
 	~PGViewer()
 	{
-		glXMakeCurrent(m_dpy, None, nullptr);
-		glXDestroyContext(m_dpy, m_ctx);
-		XCloseDisplay(m_dpy);
+		glfwDestroyWindow(m_win);
+		glfwTerminate();
 	}
 
 	// Process pending events; false when the user asked to quit.
 	bool pump()
 	{
 		held_tick(now());
-		while (XPending(m_dpy))
-		{
-			XEvent ev;
-			XNextEvent(m_dpy, &ev);
-			switch (ev.type)
-		{
-			case KeyPress:
-				// X autorepeat fires synthetic press/release pairs sharing the
-				// same keycode+time; skip the synthetic press — repeats are
-				// driven by our own held-key timer at a chosen rate
-				if (ev.xkey.keycode == m_last_press_keycode && ev.xkey.time == m_last_press_time)
-					break;
-				m_last_press_keycode = ev.xkey.keycode;
-				m_last_press_time = ev.xkey.time;
-				{
-					const KeySym ks = XLookupKeysym(&ev.xkey, 0);
-					handle_key(ks);
-					hold_begin(ev.xkey.keycode, ks);
-				}
-				break;
-			case KeyRelease:
-				// synthetic release: a matching press is queued right behind it
-				if (XPending(m_dpy))
-				{
-					XEvent nxt;
-					XPeekEvent(m_dpy, &nxt);
-					if (nxt.type == KeyPress && nxt.xkey.keycode == ev.xkey.keycode
-						&& nxt.xkey.time == ev.xkey.time)
-						break; // keep held
-				}
-				hold_end(ev.xkey.keycode);
-				break;
-			case FocusOut:
-				hold_clear(); // we may have missed the releases
-				break;
-			case ButtonPress:
-				if (ev.xbutton.button == 1)
-				{
-					m_dragging = true;
-					m_last_x = ev.xbutton.x;
-					m_last_y = ev.xbutton.y;
-				}
-				else if (ev.xbutton.button == 4)
-					zoom(0.88f);
-				else if (ev.xbutton.button == 5)
-					zoom(1.0f / 0.88f);
-				break;
-			case ButtonRelease:
-				if (ev.xbutton.button == 1)
-					m_dragging = false;
-				break;
-			case MotionNotify:
-				if (m_dragging)
-				{
-					m_yaw += (ev.xmotion.x - m_last_x) * 0.005f;
-					m_pitch += (ev.xmotion.y - m_last_y) * 0.005f;
-					if (m_pitch < 0.05f) m_pitch = 0.05f;
-					if (m_pitch > 1.5f) m_pitch = 1.5f;
-					m_last_x = ev.xmotion.x;
-					m_last_y = ev.xmotion.y;
-				}
-				break;
-			case ConfigureNotify:
-				m_w = ev.xconfigure.width;
-				m_h = ev.xconfigure.height;
-				glViewport(0, 0, m_w, m_h);
-				break;
-			case ClientMessage:
-				if ((Atom)ev.xclient.data.l[0] == m_wm_delete)
-					m_quit = true;
-				break;
-			default:
-				break;
-			}
-		}
+		glfwPollEvents();
 		return !m_quit;
 	}
 
@@ -209,9 +114,7 @@ public:
 	{
 		int n = 0;
 		while (n < cap && m_pending_n > 0)
-		{
 			out[n++] = m_pending[--m_pending_n];
-		}
 		// preserve issue order: pending is a stack; reverse drained part
 		for (int i = 0; i < n / 2; ++i)
 		{
@@ -248,15 +151,10 @@ public:
 		draw_bodies(inBodies, inN);
 		draw_hud(inStep, inStepTotal, inCmds, inTotalBodies);
 
-		glXSwapBuffers(m_dpy, m_win);
+		glfwSwapBuffers(m_win);
 	}
 
-	double now() const
-	{
-		struct timespec ts;
-		clock_gettime(CLOCK_MONOTONIC, &ts);
-		return (double)ts.tv_sec + 1.0e-9 * (double)ts.tv_nsec;
-	}
+	double now() const { return glfwGetTime(); }
 
 	// display-held interaction state (quantized; recorded only when a key
 	// actually issues a command)
@@ -276,74 +174,229 @@ public:
 private:
 	PGViewer() = default;
 
-	// windowed start; F11 (or the WM) toggles EWMH fullscreen
+	// --- GLFW callbacks (route into the instance) ---
+	static PGViewer* self(GLFWwindow* w) { return (PGViewer*)glfwGetWindowUserPointer(w); }
+
+	static void close_cb(GLFWwindow* w)
+	{
+		self(w)->m_quit = true;
+	}
+
+	static void fb_size_cb(GLFWwindow* w, int width, int height)
+	{
+		PGViewer* v = self(w);
+		v->m_w = width;
+		v->m_h = height;
+		glViewport(0, 0, width, height);
+	}
+
+	static void focus_cb(GLFWwindow* w, int focused)
+	{
+		if (!focused)
+			self(w)->hold_clear(); // we may have missed the releases
+	}
+
+	static void mouse_cb(GLFWwindow* w, int button, int action, int)
+	{
+		PGViewer* v = self(w);
+		if (button == GLFW_MOUSE_BUTTON_LEFT)
+		{
+			if (action == GLFW_PRESS)
+			{
+				v->m_dragging = true;
+				glfwGetCursorPos(w, (double*)&v->m_last_x, (double*)&v->m_last_y);
+			}
+			else
+			{
+				v->m_dragging = false;
+			}
+		}
+	}
+
+	static void cursor_cb(GLFWwindow* w, double x, double y)
+	{
+		PGViewer* v = self(w);
+		if (!v->m_dragging)
+			return;
+		v->m_yaw += (float)(x - v->m_last_x) * 0.005f;
+		v->m_pitch += (float)(y - v->m_last_y) * 0.005f;
+		if (v->m_pitch < 0.05f) v->m_pitch = 0.05f;
+		if (v->m_pitch > 1.5f) v->m_pitch = 1.5f;
+		v->m_last_x = (float)x;
+		v->m_last_y = (float)y;
+	}
+
+	static void scroll_cb(GLFWwindow* w, double, double dy)
+	{
+		self(w)->zoom(dy > 0 ? 0.88f : 1.0f / 0.88f);
+	}
+
+	static void key_cb(GLFWwindow* w, int key, int, int action, int)
+	{
+		// GLFW_REPEAT is ignored: repeats are driven by our own held-key
+		// timer (uniform delay/rate on every platform)
+		PGViewer* v = self(w);
+		if (action == GLFW_PRESS || action == GLFW_RELEASE)
+		{
+			if (action == GLFW_PRESS)
+			{
+				v->handle_key(key);
+				v->hold_begin(key);
+			}
+			else
+			{
+				v->hold_end(key);
+			}
+		}
+	}
+
+	// --- interaction ---
+	void zoom(float f)
+	{
+		m_dist *= f;
+		if (m_dist < 8.0f) m_dist = 8.0f;
+		if (m_dist > 400.0f) m_dist = 400.0f;
+	}
+
 	void toggle_fullscreen()
 	{
-		Atom wm_state = XInternAtom(m_dpy, "_NET_WM_STATE", False);
-		Atom wm_fullscreen = XInternAtom(m_dpy, "_NET_WM_STATE_FULLSCREEN", False);
-		XEvent e;
-		memset(&e, 0, sizeof(e));
-		e.xclient.type = ClientMessage;
-		e.xclient.window = m_win;
-		e.xclient.message_type = wm_state;
-		e.xclient.format = 32;
-		e.xclient.data.l[0] = m_fullscreen ? 0 : 1; // _NET_WM_STATE_REMOVE / _ADD
-		e.xclient.data.l[1] = (long)wm_fullscreen;
-		e.xclient.data.l[2] = 0;
-		XSendEvent(m_dpy, DefaultRootWindow(m_dpy), False,
-			SubstructureRedirectMask | SubstructureNotifyMask, &e);
-		XFlush(m_dpy);
-		m_fullscreen = !m_fullscreen;
+		if (!m_fullscreen)
+		{
+			glfwGetWindowPos(m_win, &m_win_x, &m_win_y);
+			glfwGetWindowSize(m_win, &m_win_w, &m_win_h);
+			GLFWmonitor* mon = glfwGetPrimaryMonitor();
+			const GLFWvidmode* mode = glfwGetVideoMode(mon);
+			glfwSetWindowMonitor(m_win, mon, 0, 0, mode->width, mode->height, GLFW_DONT_CARE);
+			m_fullscreen = true;
+		}
+		else
+		{
+			glfwSetWindowMonitor(m_win, nullptr, m_win_x, m_win_y, m_win_w, m_win_h, GLFW_DONT_CARE);
+			m_fullscreen = false;
+		}
+	}
+
+	void push_cmd(uint8_t op, int32_t a, int32_t b)
+	{
+		if (m_pending_n >= (int)(sizeof(m_pending) / sizeof(m_pending[0])))
+			return;
+		m_pending[m_pending_n].op = op;
+		m_pending[m_pending_n].a = a;
+		m_pending[m_pending_n].b = b;
+		++m_pending_n;
+	}
+
+	void handle_key(int key)
+	{
+		switch (key)
+		{
+		case GLFW_KEY_COMMA: case GLFW_KEY_LEFT:
+			aim_slot = (aim_slot + 31) % 32;
+			break;
+		case GLFW_KEY_PERIOD: case GLFW_KEY_RIGHT:
+			aim_slot = (aim_slot + 1) % 32;
+			break;
+		case GLFW_KEY_UP:
+			if (elev < 68) ++elev;
+			break;
+		case GLFW_KEY_DOWN:
+			if (elev > 0) --elev;
+			break;
+		case GLFW_KEY_EQUAL: case GLFW_KEY_KP_ADD:
+			zoom(0.88f);
+			break;
+		case GLFW_KEY_MINUS: case GLFW_KEY_KP_SUBTRACT:
+			zoom(1.0f / 0.88f);
+			break;
+		case GLFW_KEY_P: case GLFW_KEY_SPACE:
+			m_paused = !m_paused;
+			break;
+		case GLFW_KEY_F11:
+			toggle_fullscreen();
+			break;
+		case GLFW_KEY_Q: case GLFW_KEY_ESCAPE:
+			m_quit = true;
+			break;
+		default:
+			break;
+		}
+		if (replay_mode)
+			return; // no live commands on a recorded timeline
+		switch (key)
+		{
+		case GLFW_KEY_F:
+			push_cmd(PG_OP_FIRE_BALL, aim_slot, mass_class | (elev << 2));
+			break;
+		case GLFW_KEY_B:
+			push_cmd(PG_OP_DROP_BOX, drop_i - 4, drop_j - 4);
+			drop_i = (drop_i + 1) % 9;
+			if (drop_i == 0)
+				drop_j = (drop_j + 1) % 9;
+			break;
+		case GLFW_KEY_X:
+			push_cmd(PG_OP_SHOCKWAVE, shock_k, 0);
+			break;
+		case GLFW_KEY_S:
+			shock_k = (shock_k + 1) % 3;
+			break;
+		case GLFW_KEY_G:
+			gravity_mode = (gravity_mode + 1) & 3;
+			push_cmd(PG_OP_GRAVITY, gravity_mode, 0);
+			break;
+		case GLFW_KEY_1: mass_class = 0; break;
+		case GLFW_KEY_2: mass_class = 1; break;
+		case GLFW_KEY_3: mass_class = 2; break;
+		default:
+			break;
+		}
 	}
 
 	// held-key repeat for the aim/elevation keys: our own timer (initial
-	// delay, then fixed rate) — independent of X server autorepeat, which
-	// is filtered out in pump() so it cannot double-fire
+	// delay, then fixed rate) — platform-independent (GLFW repeats ignored)
 	static constexpr double HOLD_REPEAT_DELAY = 0.30;
 	static constexpr double HOLD_REPEAT_RATE = 0.07;
 
 	struct HeldKey
 	{
-		unsigned int keycode = 0;
-		KeySym ks = 0;
+		int key = 0;
 		double next_time = 0.0;
 		bool active = false;
 	};
 
-	static bool is_repeatable(KeySym ks)
+	static bool is_repeatable(int key)
 	{
-		return ks == XK_Left || ks == XK_Right || ks == XK_Up || ks == XK_Down
-			|| ks == XK_comma || ks == XK_period;
+		return key == GLFW_KEY_LEFT || key == GLFW_KEY_RIGHT || key == GLFW_KEY_UP
+			|| key == GLFW_KEY_DOWN || key == GLFW_KEY_COMMA || key == GLFW_KEY_PERIOD;
 	}
 
-	void hold_begin(unsigned int keycode, KeySym ks)
+	void hold_begin(int key)
 	{
-		if (!is_repeatable(ks))
+		if (!is_repeatable(key))
 			return;
-		HeldKey* slot = nullptr;
 		for (HeldKey& h : m_held)
 		{
-			if (h.active && h.keycode == keycode)
+			if (h.active && h.key == key)
 			{
 				h.next_time = now() + HOLD_REPEAT_DELAY;
 				return;
 			}
-			if (!h.active && !slot)
-				slot = &h;
 		}
-		if (slot)
+		for (HeldKey& h : m_held)
 		{
-			slot->active = true;
-			slot->keycode = keycode;
-			slot->ks = ks;
-			slot->next_time = now() + HOLD_REPEAT_DELAY;
+			if (!h.active)
+			{
+				h.active = true;
+				h.key = key;
+				h.next_time = now() + HOLD_REPEAT_DELAY;
+				return;
+			}
 		}
 	}
 
-	void hold_end(unsigned int keycode)
+	void hold_end(int key)
 	{
 		for (HeldKey& h : m_held)
-			if (h.active && h.keycode == keycode)
+			if (h.active && h.key == key)
 				h.active = false;
 	}
 
@@ -359,89 +412,12 @@ private:
 		{
 			if (!h.active || t < h.next_time)
 				continue;
-			handle_key(h.ks);
+			handle_key(h.key);
 			h.next_time = t + HOLD_REPEAT_RATE;
 		}
 	}
 
-	void zoom(float f)
-	{
-		m_dist *= f;
-		if (m_dist < 8.0f) m_dist = 8.0f;
-		if (m_dist > 400.0f) m_dist = 400.0f;
-	}
-
-	void push_cmd(uint8_t op, int32_t a, int32_t b)
-	{
-		if (m_pending_n >= (int)(sizeof(m_pending) / sizeof(m_pending[0])))
-			return; // drop oldest? just drop (16 buffered per frame is plenty)
-		m_pending[m_pending_n].op = op;
-		m_pending[m_pending_n].a = a;
-		m_pending[m_pending_n].b = b;
-		++m_pending_n;
-	}
-
-	void handle_key(KeySym ks)
-	{
-		switch (ks)
-		{
-		case XK_F11:
-			toggle_fullscreen();
-			break;
-		case XK_comma: case XK_Left:
-			aim_slot = (aim_slot + 31) % 32;
-			break;
-		case XK_period: case XK_Right:
-			aim_slot = (aim_slot + 1) % 32;
-			break;
-		case XK_Up:
-			if (elev < 68) ++elev;
-			break;
-		case XK_Down:
-			if (elev > 0) --elev;
-			break;
-		case XK_plus: case XK_equal: zoom(0.88f); break;
-		case XK_minus: zoom(1.0f / 0.88f); break;
-		case XK_p: case XK_P: case XK_space:
-			m_paused = !m_paused;
-			break;
-		case XK_q: case XK_Q: case XK_Escape:
-			m_quit = true;
-			break;
-		default:
-			break;
-		}
-		if (replay_mode)
-			return; // no live commands on a recorded timeline
-		switch (ks)
-		{
-		case XK_F: case XK_f:
-			push_cmd(PG_OP_FIRE_BALL, aim_slot, mass_class | (elev << 2));
-			break;
-		case XK_B: case XK_b:
-			push_cmd(PG_OP_DROP_BOX, drop_i - 4, drop_j - 4);
-			drop_i = (drop_i + 1) % 9;
-			if (drop_i == 0)
-				drop_j = (drop_j + 1) % 9;
-			break;
-		case XK_X: case XK_x:
-			push_cmd(PG_OP_SHOCKWAVE, shock_k, 0);
-			break;
-		case XK_S: case XK_s:
-			shock_k = (shock_k + 1) % 3;
-			break;
-		case XK_G: case XK_g:
-			gravity_mode = (gravity_mode + 1) & 3;
-			push_cmd(PG_OP_GRAVITY, gravity_mode, 0);
-			break;
-		case XK_1: mass_class = 0; break;
-		case XK_2: mass_class = 1; break;
-		case XK_3: mass_class = 2; break;
-		default:
-			break;
-		}
-	}
-
+	// --- GL setup and drawing (unchanged fixed-function code) ---
 	void init_gl()
 	{
 		glEnable(GL_DEPTH_TEST);
@@ -466,18 +442,6 @@ private:
 		glNewList(m_sphere_list, GL_COMPILE);
 		draw_unit_sphere(16, 10);
 		glEndList();
-
-		m_font_base = glGenLists(224);
-		m_have_font = false;
-		XFontStruct* font = XLoadQueryFont(m_dpy, "-misc-fixed-medium-semibold-*-*-*-13-*-*-*-*-*-*-*");
-		if (!font)
-			font = XLoadQueryFont(m_dpy, "fixed");
-		if (font)
-		{
-			glXUseXFont(font->fid, 32, 224, m_font_base + 32);
-			XFreeFont(m_dpy, font);
-			m_have_font = true;
-		}
 	}
 
 	void draw_unit_cube()
@@ -553,19 +517,15 @@ private:
 			0, 1, 1, 3, 1, 4, 2, 4, 1, 4, 2, 4, 1, 3, 1, 1,
 			0, -1, -1, -3, -1, -4, -2, -4, -1, -4, -2, -4, -1, -3, -1, -1 };
 		static const float elev_slope[69] = {
-	-11.430052757263184f, -7.595754146575928f, -5.671281814575195f, -4.510708332061768f, -3.732050895690918f, -3.1715948581695557f,
-	-2.7474775314331055f, -2.4142136573791504f, -2.1445069313049316f, -1.9209821224212646f, -1.7320507764816284f, -1.5696855783462524f,
-	-1.4281480312347412f, -1.3032253980636597f, -1.191753625869751f, -1.0913084745407104f, -1.0f, -0.9163311719894409f,
-	-0.839099645614624f, -0.7673270106315613f, -0.700207531452179f, -0.6370702385902405f, -0.5773502588272095f, -0.5205670595169067f,
-	-0.466307669878006f, -0.4142135679721832f, -0.36397022008895874f, -0.31529879570007324f, -0.2679491937160492f, -0.22169466316699982f,
-	-0.17632697522640228f, -0.13165250420570374f, -0.08748866617679596f, -0.04366094246506691f, 0.0f, 0.04366094246506691f,
-	0.08748866617679596f, 0.13165250420570374f, 0.17632697522640228f, 0.22169466316699982f, 0.2679491937160492f, 0.31529879570007324f,
-	0.36397022008895874f, 0.4142135679721832f, 0.466307669878006f, 0.5205670595169067f, 0.5773502588272095f, 0.6370702385902405f,
-	0.700207531452179f, 0.7673270106315613f, 0.839099645614624f, 0.9163311719894409f, 1.0f, 1.0913084745407104f,
-	1.191753625869751f, 1.3032253980636597f, 1.4281480312347412f, 1.5696855783462524f, 1.7320507764816284f, 1.9209821224212646f,
-	2.1445069313049316f, 2.4142136573791504f, 2.7474775314331055f, 3.1715948581695557f, 3.732050895690918f, 4.510708332061768f,
-	5.671281814575195f, 7.595754146575928f, 11.430052757263184f
-		};
+			-11.430052757263184f, -7.595754146575928f, -5.671281814575195f, -4.510708332061768f, -3.732050895690918f, -3.1715948581695557f, -2.7474775314331055f, -2.4142136573791504f,
+			-2.1445069313049316f, -1.9209821224212646f, -1.7320507764816284f, -1.5696855783462524f, -1.4281480312347412f, -1.3032253980636597f, -1.191753625869751f, -1.0913084745407104f,
+			-1.0f, -0.9163311719894409f, -0.839099645614624f, -0.7673270106315613f, -0.700207531452179f, -0.6370702385902405f, -0.5773502588272095f, -0.5205670595169067f,
+			-0.466307669878006f, -0.4142135679721832f, -0.36397022008895874f, -0.31529879570007324f, -0.2679491937160492f, -0.22169466316699982f, -0.17632697522640228f, -0.13165250420570374f,
+			-0.08748866617679596f, -0.04366094246506691f, 0.0f, 0.04366094246506691f, 0.08748866617679596f, 0.13165250420570374f, 0.17632697522640228f, 0.22169466316699982f,
+			0.2679491937160492f, 0.31529879570007324f, 0.36397022008895874f, 0.4142135679721832f, 0.466307669878006f, 0.5205670595169067f, 0.5773502588272095f, 0.6370702385902405f,
+			0.700207531452179f, 0.7673270106315613f, 0.839099645614624f, 0.9163311719894409f, 1.0f, 1.0913084745407104f, 1.191753625869751f, 1.3032253980636597f,
+			1.4281480312347412f, 1.5696855783462524f, 1.7320507764816284f, 1.9209821224212646f, 2.1445069313049316f, 2.4142136573791504f, 2.7474775314331055f, 3.1715948581695557f,
+			3.732050895690918f, 4.510708332061768f, 5.671281814575195f, 7.595754146575928f, 11.430052757263184f };
 		static const float ball_r[3] = { 0.6f, 0.95f, 1.3f };
 		const float hl = sqrtf((float)(dx[aim_slot] * dx[aim_slot] + dz[aim_slot] * dz[aim_slot]));
 		const float ux = (float)dx[aim_slot] / hl;
@@ -632,14 +592,40 @@ private:
 		}
 	}
 
-	void hud_line(float x, float y, const char* s)
+	// 8x8 embedded font, drawn as quads (fixed-function only, no system
+	// font dependency)
+	void hud_text(float x, float y, const char* s)
 	{
-		if (!m_have_font)
-			return;
-		glRasterPos2f(x, y);
-		const int len = (int)strlen(s);
-		glListBase(m_font_base);
-		glCallLists(len, GL_UNSIGNED_BYTE, s);
+		glBegin(GL_QUADS);
+		float cx = x;
+		for (const char* p = s; *p; ++p)
+		{
+			const unsigned char c = (unsigned char)*p;
+			if (c >= 32 && c < 127)
+			{
+				const unsigned char* g = HUD_FONT[c - 32];
+				for (int row = 0; row < 8; ++row)
+				{
+					const unsigned char bits = g[row];
+					if (!bits)
+						continue;
+					for (int col = 0; col < 8; ++col)
+					{
+						if (bits & (0x80 >> col))
+						{
+							const float px = cx + (float)col;
+							const float py = y + (float)row;
+							glVertex2f(px, py);
+							glVertex2f(px + 1.0f, py);
+							glVertex2f(px + 1.0f, py + 1.0f);
+							glVertex2f(px, py + 1.0f);
+						}
+					}
+				}
+			}
+			cx += 8.0f;
+		}
+		glEnd();
 	}
 
 	void draw_hud(uint32_t inStep, uint32_t inStepTotal, uint32_t inCmds, uint32_t inTotalBodies)
@@ -659,11 +645,11 @@ private:
 			replay_mode ? "REPLAY" : "live", (unsigned)inStep, (unsigned)inStepTotal,
 			(double)inStep / 60.0, (unsigned)inTotalBodies, (unsigned)inCmds,
 			m_paused ? "   [PAUSED]" : "");
-		hud_line(10, 20, line);
+		hud_text(10, 14, line);
 		if (replay_mode)
 		{
 			if (hud_note[0])
-				hud_line(10, 36, hud_note);
+				hud_text(10, 30, hud_note);
 		}
 		else
 		{
@@ -671,12 +657,12 @@ private:
 			snprintf(line, sizeof(line), "aim %d/32   elev %d/68 (%+.1f deg)   ball %d   shock %d/3   gravity %s",
 				aim_slot, elev, (float)(elev - 34) * 2.5f,
 				mass_class + 1, shock_k + 1, grav_name[gravity_mode]);
-			hud_line(10, 36, line);
+			hud_text(10, 30, line);
 		}
 		snprintf(line, sizeof(line), replay_mode
 			? "replay: [p]ause [q]uit   mouse: orbit / zoom   [F11]fullscreen"
-			: "[f]ire [b]ox   shock: [s] strength, [x] blast   [g]ravity cycles earth/moon/zero/up   aim: hold arrows   elev: hold Up/Down   [1-3]ball [p]ause [F11] [q]end");
-		hud_line(10, m_h - 12, line);
+			: "[f]ire [b]ox   shock: [s] strength, [x] blast   [g]ravity cycles   aim: hold arrows   elev: hold Up/Down   [1-3]ball [p]ause [F11] [q]end");
+		hud_text(10, (float)m_h - 14, line);
 
 		glPopMatrix();
 		glMatrixMode(GL_PROJECTION);
@@ -736,28 +722,21 @@ private:
 		glTranslatef(-ex, -ey, -ez);
 	}
 
-	Display* m_dpy = nullptr;
-	Window m_win = 0;
-	GLXContext m_ctx = nullptr;
-	Colormap m_cmap = 0;
-	Atom m_wm_delete = 0;
+	GLFWwindow* m_win = nullptr;
 	int m_w = 0, m_h = 0;
 	bool m_quit = false;
 	bool m_paused = false;
 	bool m_fullscreen = false;
 	bool m_dragging = false;
-	int m_last_x = 0, m_last_y = 0;
-	unsigned int m_last_press_keycode = 0;
-	unsigned long m_last_press_time = 0;
-	HeldKey m_held[6];
+	float m_last_x = 0.0f, m_last_y = 0.0f;
+	int m_win_x = 0, m_win_y = 0, m_win_w = 0, m_win_h = 0;
 	float m_yaw = 0.7f;
 	float m_pitch = 0.45f;
 	float m_dist = 50.0f;
 	float m_target_y = 10.0f;
 	GLuint m_cube_list = 0;
 	GLuint m_sphere_list = 0;
-	GLuint m_font_base = 0;
-	bool m_have_font = false;
+	HeldKey m_held[6];
 	PGViewCmd m_pending[32];
 	int m_pending_n = 0;
 };

@@ -344,13 +344,25 @@ prove-openvm-pyramid: build-openvm-pyramid
 
 DEMO_HEIGHT ?= 6
 DEMO_OUT := build/session.bin
+
+# GLFW viewer dependency (recorder/replayer window). pkg-config first
+# (apt libglfw3-dev / brew glfw / vcpkg glfw3 all ship glfw3.pc), then a
+# per-OS fallback.
+GLFW_CFLAGS := $(shell pkg-config --cflags glfw3 2>/dev/null)
+GLFW_PC_LIBS := $(shell pkg-config --libs glfw3 2>/dev/null)
+ifeq ($(shell uname),Darwin)
+	GLFW_LIBS := $(if $(GLFW_PC_LIBS),$(GLFW_PC_LIBS),-lglfw -framework OpenGL -framework Cocoa -framework IOKit -framework CoreVideo)
+else
+	# glfw3.pc keeps libGL in Requires.private — link it ourselves
+	GLFW_LIBS := $(if $(GLFW_PC_LIBS),$(GLFW_PC_LIBS),-lglfw) -lGL
+endif
 # native sidecar derived the same way playground.cpp writes it (".bin" stripped)
 DEMO_FINAL := $(basename $(DEMO_OUT))_final.bin
 
 JOLT_PG_NATIVE_CXXFLAGS := $(JOLT_NATIVE_CXXFLAGS) -I $(JOLT)/PerformanceTest
 
 build-native-playground: build/libJolt_native.a
-	$(CLANGXX) $(JOLT_PG_NATIVE_CXXFLAGS) demo/playground.cpp build/libJolt_native.a -o build/playground_native -lX11 -lGL
+	$(CLANGXX) $(JOLT_PG_NATIVE_CXXFLAGS) $(GLFW_CFLAGS) demo/playground.cpp build/libJolt_native.a -o build/playground_native $(GLFW_LIBS)
 
 demo-play: build-native-playground
 	@if [ -z "$$DISPLAY" ]; then echo "impulse: no \$$DISPLAY — try: make demo-auto"; exit 1; fi

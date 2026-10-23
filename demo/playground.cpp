@@ -188,7 +188,9 @@ static Vec3 g_aim[IMP_AIM_SLOTS];
 static RefConst<Shape> g_box_shape;
 static float g_drop_y;	// pyramid-relative drop height (set in sim_create)
 static Vec3 g_gravity[4];	// earth / moon / zero / up (set in sim_create)
+#ifndef OPENVM
 static uint32_t g_scene_body_count;	// bodies created by the scene (viewer coloring)
+#endif
 
 // Command log: commands are appended with the step they apply at, and
 // consumed in order while stepping. g_cmd_count only ever contains
@@ -309,7 +311,9 @@ static void sim_create(const SessionHeader& inHeader)
 	g_gravity[1] = Vec3(0.0f, -1.62f, 0.0f);
 	g_gravity[2] = Vec3::sZero();
 	g_gravity[3] = Vec3(0.0f, 9.81f, 0.0f);
+#ifndef OPENVM
 	g_scene_body_count = g_physics->GetNumBodies();
+#endif
 }
 
 static void sim_destroy()

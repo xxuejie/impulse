@@ -51,7 +51,12 @@ docs/                 libcxx-comparison.md, future.md (proving economics study)
 
 ## Usage
 
-Requires clang/LLVM and a recent Rust toolchain. Then:
+Requires clang/LLVM, a recent Rust toolchain, and GLFW for the demo
+window (apt `libglfw3-dev` / brew `glfw` / vcpkg `glfw3`). The
+recorder/replayer (`demo-play`, `demo-replay`, `demo-auto`) builds on
+Linux, macOS and Windows (MSYS2/vcpkg); the zkVM leg
+(`demo-verify`, `demo-prove`) is Linux-shaped (shell-driven dep
+builds — WSL on Windows). Then:
 
 ```sh
 git submodule update --init --recursive
@@ -96,8 +101,9 @@ make demo-prove    # tiny session + full zk proof (~2M instr, ~30 GB — free -g
 `DEMO_HEIGHT` (default 6) sizes the pyramid; `DEMO_STEPS`/`DEMO_SCRIPT`
 size headless sessions, e.g.
 `make demo-auto DEMO_HEIGHT=8 DEMO_STEPS=600 DEMO_SCRIPT="F:60:0:2,X:200:2"`.
-The viewer needs only libX11 + libGL; camera controls (mouse) are
-never recorded — only the quantized physics commands are.
+The viewer is GLFW + fixed-function OpenGL with an embedded HUD font
+(legacy 2.1 context on macOS); camera controls (mouse) are never
+recorded — only the quantized physics commands are.
 
 Future work (proving economics, circuit ideas): `docs/future.md`.
 
