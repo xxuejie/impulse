@@ -52,18 +52,19 @@ run_config() {
 	fi
 }
 
-# Playground golden session: native replay + VM replay must both reproduce
-# the recording (hash + blob). Reuses the demo-regress target.
+# Playground golden session: native replay reproduces the recording, the
+# generic VM verifier accepts it (verdict 0) and rejects a tampered copy.
+# Reuses the demo-regress target.
 run_playground() {
 	local out
 	out=$(make demo-regress 2>&1)
-	if echo "$out" | grep -q 'replay reproduces the recorded session' \
-		&& echo "$out" | grep -q 'golden hash MATCH' \
-		&& echo "$out" | grep -q 'golden state blob byte-identical'; then
-		echo "PASS playground golden (native + vm reproduce the recording)"
+	if echo "$out" | grep -q 'native golden hash MATCH' \
+		&& echo "$out" | grep -q 'VM verifier verdict 0 (VALID)' \
+		&& echo "$out" | grep -q 'tampered session correctly rejected'; then
+		echo "PASS playground golden (native replay + VM verifier accept/reject)"
 	else
 		echo "FAIL playground golden:"
-		echo "$out" | grep -E 'MISMATCH|FAIL|hash' | sed 's/^/      /'
+		echo "$out" | grep -E 'MISMATCH|FAIL|hash|verdict' | sed 's/^/      /'
 		FAIL=1
 	fi
 }

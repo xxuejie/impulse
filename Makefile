@@ -326,11 +326,11 @@ prove-openvm-pyramid: build-openvm-pyramid
 #           keys, resolved to quantized ops) + final state hash — is
 #           recorded in build/session.bin (+ .cmds.txt/.world0.txt
 #           sidecars, + _final.bin state blob).
-#   openvm: the session is baked into the ELF (scripts/bin2h.py ->
-#           build/session_data.h); the guest rebuilds the world, verifies
-#           the initial world hash, replays every command at the exact
-#           step, and reveals the final state hash — printing whether it
-#           matches the recording.
+#   openvm: ONE GENERIC VERIFIER BINARY — the session (initial world
+#           dump + commands + claimed hashes) arrives on the OpenVM input
+#           stream (--input); the guest re-simulates it and reveals a
+#           single verdict value: 0 = simulated final hash matches the
+#           claim, non-zero = rejection code.
 #
 #   make demo-play    fire up the window and play (keys below); q ends
 #   make demo-verify  run the recording in OpenVM; prints hash MATCH/MISMATCH
@@ -357,9 +357,6 @@ else
 	# glfw3.pc keeps libGL in Requires.private — link it ourselves
 	GLFW_LIBS := $(if $(GLFW_PC_LIBS),$(GLFW_PC_LIBS),-lglfw) -lGL
 endif
-# native sidecar derived the same way playground.cpp writes it (".bin" stripped)
-DEMO_FINAL := $(basename $(DEMO_OUT))_final.bin
-
 JOLT_PG_NATIVE_CXXFLAGS := $(JOLT_NATIVE_CXXFLAGS) -I $(JOLT)/PerformanceTest
 
 build-native-playground: build/libJolt_native.a
@@ -378,22 +375,22 @@ demo-auto: build-native-playground
 $(DEMO_OUT):
 	@echo "impulse: $(DEMO_OUT) missing — record one first: make demo-play (or demo-auto)"; exit 1
 
-build/session_data.h: $(DEMO_OUT)
-	python3 scripts/bin2h.py build/session.bin build/session_data.h
-
-build-openvm-playground: $(MUSL_TARGET) $(BUILTINS_TARGET) $(LIBCXX_TARGET) $(RUNTIME_OBJS) build/libJolt.a build/session_data.h
-	$(CLANGXX) $(JOLT_CXXFLAGS) -I $(JOLT)/PerformanceTest -I build demo/playground.cpp -c -o build/playground.o
+# The VM guest is GENERIC: the session arrives on the OpenVM input
+# stream (--input), no session data is baked into the binary.
+build-openvm-playground: $(MUSL_TARGET) $(BUILTINS_TARGET) $(LIBCXX_TARGET) $(RUNTIME_OBJS) build/libJolt.a
+	$(CLANGXX) $(JOLT_CXXFLAGS) -I $(JOLT)/PerformanceTest demo/playground.cpp -c -o build/playground.o
 	$(LD) $(LDFLAGS) build/playground.o build/libJolt.a $(RUNTIME_OBJS) -o build/playground
 
+# Runs the recorded session through the generic verifier guest on the VM
+# (session fed via the OpenVM input stream; guest verdict must be 0).
 # PROVE=1 runs execute+prove+verify in the runner (RAM-heavy; see README).
 demo-verify: build-openvm-playground
 	cd runner && cargo build --release $(RUNNER_FEATURES)
 ifeq ($(PROVE),1)
-	./runner/target/release/impulse-runner prove build/playground
+	./runner/target/release/impulse-runner prove --input $(DEMO_OUT) build/playground
 else
-	RUST_LOG=openvm_circuit::arch::interpreter=info ./runner/target/release/impulse-runner build/playground
+	RUST_LOG=openvm_circuit::arch::interpreter=info ./runner/target/release/impulse-runner --input $(DEMO_OUT) build/playground
 endif
-	cmp $(DEMO_FINAL) state_openvm.bin && echo "impulse: state blob and zkVM reveal are byte-identical"
 
 # Golden-session regression: replay the committed session natively and on
 # the VM; both hashes and the full state blob must match the committed
@@ -402,15 +399,23 @@ endif
 demo-regress: build-native-playground
 	cp tests/golden-session.bin build/session.bin
 	./build/playground_native --replay build/session.bin --headless | tail -n 2
+	@exp=$$(cat tests/golden-hash.txt); \
+		if ./build/playground_native --replay build/session.bin --headless | grep -q "replayed final hash: $$exp"; then \
+			echo "impulse: native golden hash MATCH ($$exp)"; \
+		else echo "impulse: native golden hash MISMATCH"; exit 1; fi
 	$(MAKE) build-openvm-playground
 	cd runner && cargo build --release $(RUNNER_FEATURES)
-	./runner/target/release/impulse-runner build/playground > build/regress-vm.log 2>&1
-	grep -E 'sha256:' build/regress-vm.log
-	@exp=$$(cat tests/golden-hash.txt); \
-		if grep -q "VM final hash:.*$$exp" build/regress-vm.log; then \
-			echo "impulse: golden hash MATCH ($$exp)"; \
-		else echo "impulse: golden hash MISMATCH (expected $$exp)"; grep 'final hash' build/regress-vm.log; exit 1; fi
-	cmp tests/golden-final.bin state_openvm.bin && echo "impulse: golden state blob byte-identical"
+	./runner/target/release/impulse-runner --input tests/golden-session.bin build/playground > build/regress-vm.log 2>&1 \
+		|| { cat build/regress-vm.log; exit 1; }
+	grep -q 'verdict = 0' build/regress-vm.log \
+		&& echo "impulse: VM verifier verdict 0 (VALID) on the golden session" \
+		|| { cat build/regress-vm.log; exit 1; }
+	python3 scripts/tamper-session.py tests/golden-session.bin build/session-tampered.bin final
+	if ./runner/target/release/impulse-runner --input build/session-tampered.bin build/playground > build/regress-tamper.log 2>&1; then \
+		echo "impulse: TAMPER CHECK FAILED (verdict 0 on a corrupted session)"; exit 1; fi
+	grep -q 'verdict = 4' build/regress-tamper.log \
+		&& echo "impulse: tampered session correctly rejected (verdict 4 = BAD FINAL HASH)" \
+		|| { cat build/regress-tamper.log; exit 1; }
 
 demo-e2e:
 	$(MAKE) demo-auto
@@ -421,7 +426,7 @@ demo-e2e:
 demo-stats: build-openvm-playground
 	cd runner && cargo build --release $(RUNNER_FEATURES)
 	@RUST_LOG=openvm_circuit::arch::interpreter=info \
-		./runner/target/release/impulse-runner build/playground 2>/dev/null \
+		./runner/target/release/impulse-runner --input $(DEMO_OUT) build/playground 2>/dev/null \
 		| grep instructions_executed | sed 's/.*instructions_executed=//' > build/session.instr
 	python3 scripts/session-stats.py $(DEMO_OUT) $$(cat build/session.instr)
 
@@ -432,10 +437,9 @@ demo-stats: build-openvm-playground
 demo-prove:
 	$(MAKE) demo-auto DEMO_HEIGHT=2 DEMO_STEPS=3 DEMO_SCRIPT="F:1:0:1"
 	$(MAKE) demo-verify PROVE=1
-	# standalone third-party check of the persisted artifact against the
-	# recorded session hash (no ELF, no execution):
-	./runner/target/release/impulse-runner verify build/playground.proof \
-		$$(python3 scripts/session-stats.py --hash $(DEMO_OUT))
+	# standalone third-party check of the persisted artifact (no ELF, no
+	# execution): the proof's verdict value must be 0
+	./runner/target/release/impulse-runner verify build/playground.proof
 
 # --- Dependencies ----------------------------------------------------------
 

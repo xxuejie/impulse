@@ -59,10 +59,7 @@ using namespace JPH;
 #ifdef OPENVM
 #include <openvm/openvm_vm.h>
 #include <openvm/openvm_sha256.h>
-#if !__has_include("session_data.h")
-#error "session_data.h missing: run `make demo-auto` (or demo-live) first, then `make demo-replay`"
-#endif
-#include "session_data.h"
+#include "../runtime/openvm_io.h"
 #else
 #include "viewer.h"
 #endif
@@ -318,6 +315,8 @@ static void sim_create(const SessionHeader& inHeader)
 
 static void sim_destroy()
 {
+	if (!g_physics)
+		return; // verifier may exit before the sim is created
 	UnregisterTypes();
 	delete Factory::sInstance;
 	Factory::sInstance = nullptr;
@@ -1058,107 +1057,150 @@ int main(int argc, char** argv)
 #endif // !OPENVM
 
 // ---------------------------------------------------------------------------
-// OpenVM: replay the baked-in session and reveal the final state hash
+// OpenVM: generic session verifier.
+//
+// One binary, no session baked in. The session (initial game state +
+// recorded player inputs + claimed final state hash) arrives on the
+// OpenVM input stream; the guest re-simulates it and reveals a single
+// output value: 0 = validation success (simulated final hash matches
+// the claim), non-zero = the failure code below.
 // ---------------------------------------------------------------------------
 #ifdef OPENVM
+
+// verdict codes (the program's only public output)
+#define IMP_VLD_OK 0u
+#define IMP_VLD_NO_INPUT 1u
+#define IMP_VLD_BAD_FORMAT 2u
+#define IMP_VLD_BAD_INITIAL 3u
+#define IMP_VLD_BAD_FINAL 4u
+
+static const char* verdict_name(uint32_t v)
+{
+	switch (v)
+	{
+	case IMP_VLD_OK: return "VALID";
+	case IMP_VLD_NO_INPUT: return "NO INPUT";
+	case IMP_VLD_BAD_FORMAT: return "BAD FORMAT";
+	case IMP_VLD_BAD_INITIAL: return "BAD INITIAL STATE";
+	case IMP_VLD_BAD_FINAL: return "BAD FINAL HASH";
+	}
+	return "?";
+}
 
 int main(int argc, char** argv)
 {
 	(void)argc; (void)argv;
 
-	if (session_bin_len < sizeof(SessionHeader))
+	printf("impulse: verifier: generic replay guest, session via input stream\n");
+
+	uint32_t status = IMP_VLD_OK;
+	uint32_t len = 0;
+	unsigned char* blob = openvm_read_input(&len);
+	const SessionHeader* header = NULL;
+	const unsigned char* world0_in = NULL;
+	BodyEntry* scratch = NULL;
+
+	do
 	{
-		printf("impulse: embedded session too small\n");
-		return 1;
-	}
-	const SessionHeader* header = (const SessionHeader*)session_bin;
-	if (memcmp(header->magic, IMP_SESSION_MAGIC, 8) != 0 || header->version != IMP_SESSION_VERSION)
-	{
-		printf("impulse: embedded session has bad magic/version\n");
-		return 1;
-	}
-	if (header->num_cmds > IMP_CMD_MAX || header->num_bodies0 > IMP_BODY_MAX
-		|| header->height > 16
-		|| session_bin_len != sizeof(SessionHeader) + sizeof(SessionCmd) * header->num_cmds
-			+ sizeof(BodyEntry) * header->num_bodies0)
-	{
-		printf("impulse: embedded session malformed\n");
-		return 1;
-	}
+		if (!blob)
+		{
+			printf("impulse: no/invalid input stream (run the runner with --input <session.bin>)\n");
+			status = IMP_VLD_NO_INPUT;
+			break;
+		}
+		if (len < sizeof(SessionHeader))
+		{
+			printf("impulse: input smaller than a session header (%u bytes)\n", (unsigned)len);
+			status = IMP_VLD_BAD_FORMAT;
+			break;
+		}
+		header = (const SessionHeader*)blob;
+		if (memcmp(header->magic, IMP_SESSION_MAGIC, 8) != 0
+			|| header->version != IMP_SESSION_VERSION
+			|| header->num_cmds > IMP_CMD_MAX || header->num_bodies0 > IMP_BODY_MAX
+			|| header->height > 16
+			|| len != sizeof(SessionHeader) + sizeof(SessionCmd) * header->num_cmds
+				+ sizeof(BodyEntry) * header->num_bodies0)
+		{
+			printf("impulse: input is not a well-formed session\n");
+			status = IMP_VLD_BAD_FORMAT;
+			break;
+		}
 
-	printf("impulse: replaying session: height=%u steps=%u cmds=%u flags=%#x solver=%u/%u\n",
-		(unsigned)header->height, (unsigned)header->total_steps, (unsigned)header->num_cmds,
-		(unsigned)header->flags, (unsigned)header->solver_v, (unsigned)header->solver_p);
+		printf("impulse: session: height=%u steps=%u cmds=%u flags=%#x solver=%u/%u\n",
+			(unsigned)header->height, (unsigned)header->total_steps, (unsigned)header->num_cmds,
+			(unsigned)header->flags, (unsigned)header->solver_v, (unsigned)header->solver_p);
 
-	sim_create(*header);
-	printf("impulse: bodies=%u active=%u\n",
-		(unsigned)g_physics->GetNumBodies(),
-		(unsigned)g_physics->GetNumActiveBodies(EBodyType::RigidBody));
+		world0_in = blob + sizeof(SessionHeader) + sizeof(SessionCmd) * header->num_cmds;
 
-	// rebuild + verify the initial world hash against the session's dump
-	BodyEntry* world0 = (BodyEntry*)malloc(sizeof(BodyEntry) * IMP_BODY_MAX);
-	const uint32_t n0 = serialize_bodies(world0, IMP_BODY_MAX);
-	unsigned char initial_hash[32];
-	session_sha256(world0, sizeof(BodyEntry) * n0, initial_hash);
+		// 1. rebuild the scene and check the INITIAL state three ways:
+		//    simulated == provided dump, dump hashes to the recorded
+		//    initial hash
+		sim_create(*header);
+		scratch = (BodyEntry*)malloc(sizeof(BodyEntry) * IMP_BODY_MAX);
+		const uint32_t n0 = serialize_bodies(scratch, IMP_BODY_MAX);
+		unsigned char hash[32];
+		session_sha256(world0_in, sizeof(BodyEntry) * header->num_bodies0, hash);
 
-	char hex[65];
-	impulse_hash_hex(initial_hash, hex);
-	char recorded_hex[65];
-	impulse_hash_hex(header->initial_hash, recorded_hex);
-	const uint32_t init_ok = n0 == header->num_bodies0 && memcmp(initial_hash, header->initial_hash, 32) == 0;
-	printf("impulse: initial world: %u/%u bodies, hash = %s (recorded %s) %s\n",
-		(unsigned)n0, (unsigned)header->num_bodies0, hex, recorded_hex,
-		init_ok ? "MATCH" : "*** MISMATCH ***");
-	free(world0);
+		char hex[65], hex2[65];
+		impulse_hash_hex(hash, hex);
+		impulse_hash_hex(header->initial_hash, hex2);
+		printf("impulse: initial world: %u/%u bodies, dump hash %s (recorded %s)\n",
+			(unsigned)n0, (unsigned)header->num_bodies0, hex, hex2);
 
-	// replay commands at their exact steps
-	memcpy(g_cmds, session_bin + sizeof(SessionHeader), sizeof(SessionCmd) * header->num_cmds);
-	g_cmd_count = header->num_cmds;
-	g_cmd_cursor = 0;
+		if (n0 != header->num_bodies0
+			|| memcmp(hash, header->initial_hash, 32) != 0
+			|| memcmp(scratch, world0_in, sizeof(BodyEntry) * n0) != 0)
+		{
+			printf("impulse: initial state does not match the recording\n");
+			status = IMP_VLD_BAD_INITIAL;
+			break;
+		}
 
-	for (uint32_t s = 1; s <= header->total_steps; ++s)
-	{
-		sim_step(s);
-		if (s % 100 == 0)
-			printf("  step %u/%u (cmds applied %u)\n", (unsigned)s,
-				(unsigned)header->total_steps, (unsigned)g_cmd_cursor);
-	}
-	if (g_cmd_cursor != header->num_cmds)
-		printf("impulse: warning: %u commands were never applied\n",
-			(unsigned)(header->num_cmds - g_cmd_cursor));
+		// 2. replay the recorded inputs at their exact steps
+		memcpy(g_cmds, blob + sizeof(SessionHeader), sizeof(SessionCmd) * header->num_cmds);
+		g_cmd_count = header->num_cmds;
+		g_cmd_cursor = 0;
+		for (uint32_t st = 1; st <= header->total_steps; ++st)
+		{
+			sim_step(st);
+			if (st % 100 == 0)
+				printf("  step %u/%u (cmds applied %u)\n", (unsigned)st,
+					(unsigned)header->total_steps, (unsigned)g_cmd_cursor);
+		}
+		if (g_cmd_cursor != header->num_cmds)
+			printf("impulse: warning: %u commands were never applied\n",
+				(unsigned)(header->num_cmds - g_cmd_cursor));
 
-	// final state + reveal
-	BodyEntry* final_entries = (BodyEntry*)malloc(sizeof(BodyEntry) * IMP_BODY_MAX);
-	const uint32_t n_final = serialize_bodies(final_entries, IMP_BODY_MAX);
+		// 3. hash the simulated final state exactly like the recorder
+		const uint32_t n_final = serialize_bodies(scratch, IMP_BODY_MAX);
+		unsigned char cmd_hash[32];
+		session_sha256(g_cmds, sizeof(SessionCmd) * header->num_cmds, cmd_hash);
+		uint32_t blob_size = 0;
+		unsigned char* final_blob = build_final_blob(*header, 1, cmd_hash, scratch, n_final, &blob_size);
+		session_sha256(final_blob, blob_size, hash);
+		free(final_blob);
 
-	unsigned char cmd_hash[32];
-	session_sha256(g_cmds, sizeof(SessionCmd) * header->num_cmds, cmd_hash);
+		impulse_hash_hex(hash, hex);
+		impulse_hash_hex(header->final_hash, hex2);
+		printf("impulse: final state hash: %s (claimed %s) %s\n", hex, hex2,
+			memcmp(hash, header->final_hash, 32) == 0 ? "MATCH" : "*** MISMATCH ***");
 
-	uint32_t blob_size = 0;
-	unsigned char* blob = build_final_blob(*header, init_ok, cmd_hash, final_entries, n_final, &blob_size);
+		if (memcmp(hash, header->final_hash, 32) != 0)
+		{
+			status = IMP_VLD_BAD_FINAL;
+			break;
+		}
+	} while (0);
 
-	unsigned char final_hash[32];
-	impulse_reveal(blob, blob_size, final_hash);
-	impulse_hash_hex(final_hash, hex);
+	// the single output value: 0 = validation success
+	openvm_reveal_u32(0, status);
+	printf("impulse: verdict = %u (%s)\n", (unsigned)status, verdict_name(status));
 
-	char recorded_final_hex[65];
-	impulse_hash_hex(header->final_hash, recorded_final_hex);
-	const int final_ok = memcmp(final_hash, header->final_hash, 32) == 0;
-
-	printf("impulse: ================================================================\n");
-	printf("impulse: replay done: %u steps, %u commands, %u bodies\n",
-		(unsigned)header->total_steps, (unsigned)header->num_cmds, (unsigned)n_final);
-	printf("impulse: VM final hash:       %s\n", hex);
-	printf("impulse: recorded final hash: %s\n", recorded_final_hex);
-	printf("impulse: %s\n", final_ok
-		? "MATCH — zkVM replay reproduces the live session bit-for-bit"
-		: "*** MISMATCH ***");
-	printf("impulse: ================================================================\n");
-
+	free(scratch);
 	free(blob);
-	free(final_entries);
 	sim_destroy();
-	return final_ok ? 0 : 1;
+	return 0;
 }
 
 #endif // OPENVM

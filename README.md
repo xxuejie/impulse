@@ -28,11 +28,11 @@ Proving (CPU, this machine): hello = 10 s / 3.1 GB; pyramid h=2
 instructions — this box proves ≤ ~2M instruction guests; larger
 scenes execute but need a GPU path or another host to prove.
 
-Proofs are persisted: `impulse-runner prove` writes a ~2 MB artifact
-(verifying key + continuation proof, bincode) next to the guest;
-`impulse-runner verify <artifact> [expected-hash]` verifies it
-anywhere in ~20 ms — no ELF, no execution — and MATCHes the revealed
-state hash against a recorded session.
+Proofs are persisted: `impulse-runner prove --input <session>` writes
+a ~2 MB artifact (verifying key + continuation proof, bincode) next
+to the guest; `impulse-runner verify <artifact>` verifies it anywhere
+in ~20 ms — no ELF, no execution — and reads the guest's public
+verdict value (0 = the session is valid, proven).
 
 ## Layout
 
@@ -44,7 +44,8 @@ overlay/              Jolt platform layer + shadowed Jolt headers
 demo/                 guests: hello, jolt_hello, pyramid, playground
                       (live demo; viewer.h = X11/GL viewer), + probes
 runner/               Rust host runner: execute / prove / verify
-runtime/              guest runtime: CRT entry, syscall layer, atomics
+runtime/              guest runtime: CRT entry, syscall layer, atomics,
+                      OpenVM input-stream reader (openvm_io.h)
 scripts/              verify-matrix.sh (three-leg determinism check)
 docs/                 libcxx-comparison.md, future.md (proving economics study)
 ```
@@ -87,11 +88,13 @@ make demo-play     # X11 window (F11 toggles fullscreen): f fire ball
                     # initial world dump, every key as a quantized command
                     # stamped with the step it applied at, and the final
                     # state hash.
-make demo-verify   # runs the recording in OpenVM: rebuilds the world,
-                    # checks the initial hash, replays every command at the
-                    # exact step, reveals the final state hash and prints
-                    # whether it matches the recording (and the revealed
-                    # blob is byte-compared against the native one)
+make demo-verify   # runs the recording through ONE GENERIC verifier
+                    # guest on the VM: the session (initial world + player
+                    # inputs + claimed final hash) is fed on the OpenVM
+                    # input stream; the guest re-simulates it and outputs
+                    # a single verdict value — 0 = the simulated final
+                    # state hash matches the claim, non-zero = rejection
+                    # (bad format / bad initial state / bad final hash)
 make demo-replay   # watch the recording again in the window: the same
                     # actions auto-fire, the same pile results
 make demo-e2e      # headless round trip (no display): demo-auto + demo-verify

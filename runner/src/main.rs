@@ -9,17 +9,22 @@
 //! caught by compile_error! below.
 //!
 //! Modes:
-//!   impulse-runner [elf]            execute, read public values, check sha256
-//!   impulse-runner prove [elf]      execute + prove; the proof artifact
-//!                                   (verifying key + continuation proof,
-//!                                   bincode) is persisted to <elf>.proof and
-//!                                   verified again via the standalone path
-//!   impulse-runner verify <proof> [expected-hash-hex]
-//!                                   standalone verification of a persisted
-//!                                   proof artifact — no ELF needed; prints
-//!                                   the revealed (ptr, size, hash) and
-//!                                   optionally MATCHes against a recorded
-//!                                   session hash
+//!   impulse-runner [--input FILE] [elf]      execute (guests that read the
+//!                                             input stream get the file's
+//!                                             bytes, one field element per
+//!                                             byte, as a single chunk)
+//!   impulse-runner prove [--input FILE] [elf]
+//!                                          execute + prove; the proof
+//!                                          artifact (verifying key +
+//!                                          continuation proof, bincode) is
+//!                                          persisted to <elf>.proof and
+//!                                          verified again via the
+//!                                          standalone path
+//!   impulse-runner verify <proof>           standalone verification of a
+//!                                          persisted proof artifact — no
+//!                                          ELF, no execution; prints the
+//!                                          guest's verdict value
+//!                                          (0 = validation success)
 
 #![allow(unexpected_cfgs)]
 
@@ -42,7 +47,7 @@ use openvm_rv32im_transpiler::{
 };
 use openvm_sha2_transpiler::Sha2TranspilerExtension;
 use openvm_stark_backend::keygen::types::MultiStarkVerifyingKey;
-use openvm_stark_backend::p3_field::PrimeField32;
+use openvm_stark_backend::p3_field::{PrimeCharacteristicRing, PrimeField32};
 use openvm_stark_backend::{StarkEngine, SystemParams};
 use openvm_stark_sdk::config::baby_bear_poseidon2::{
     BabyBearPoseidon2Config, BabyBearPoseidon2CpuEngine,
@@ -50,7 +55,6 @@ use openvm_stark_sdk::config::baby_bear_poseidon2::{
 use openvm_stark_sdk::p3_baby_bear::BabyBear;
 use openvm_transpiler::{elf::Elf, openvm_platform::memory::MEM_SIZE, transpiler::Transpiler, FromElf};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::time::Instant;
 
 #[cfg(feature = "softfloat")]
@@ -72,12 +76,9 @@ const DEFAULT_ELF_PATH: &str = "./build/hello";
 #[cfg(feature = "f")]
 const DEFAULT_ELF_PATH: &str = "./build/hello";
 
-const STATE_OUT: &str = "state_openvm.bin";
-
-const PV_PTR_OFF: usize = 0;
-const PV_SIZE_OFF: usize = 4;
-const PV_HASH_OFF: usize = 8;
-const PV_HASH_LEN: usize = 32;
+/// The guest's single public output: a verdict value at public-values
+/// byte 0 (0 = validation success; guest-specific codes otherwise).
+const PV_VERDICT_OFF: usize = 0;
 const NUM_PUBLIC_VALUES: usize = 64;
 
 // ---------------------------------------------------------------------------
@@ -116,7 +117,7 @@ fn enlarge_public_values(system: &mut SystemConfig2) {
 use openvm_circuit::arch::SystemConfig as SystemConfig2;
 
 /// Build the VM (keygen) and prove the program; returns the artifact.
-fn prove_guest(exe: VmExe<F>) -> eyre::Result<ProofFile> {
+fn prove_guest(exe: VmExe<F>, streams: Streams<F>) -> eyre::Result<ProofFile> {
     let engine: BabyBearPoseidon2CpuEngine = BabyBearPoseidon2CpuEngine::new(vm_system_params());
 
     #[cfg(feature = "softfloat")]
@@ -141,7 +142,7 @@ fn prove_guest(exe: VmExe<F>) -> eyre::Result<ProofFile> {
         .with_context(|| "failed to create proving instance")?;
 
     let proof = instance
-        .prove(Streams::<F>::default())
+        .prove(streams)
         .with_context(|| "proving failed")?;
 
     Ok(ProofFile {
@@ -151,9 +152,9 @@ fn prove_guest(exe: VmExe<F>) -> eyre::Result<ProofFile> {
     })
 }
 
-/// Standalone verification of a proof artifact. Returns the revealed
-/// (ptr, size, hash) public values on success.
-fn verify_proof_artifact(file: &ProofFile) -> eyre::Result<(u32, u32, [u8; 32])> {
+/// Standalone verification of a proof artifact. Returns the guest's
+/// verdict value (0 = validation success).
+fn verify_proof_artifact(file: &ProofFile) -> eyre::Result<u32> {
     if &file.magic != PROOF_MAGIC {
         return Err(eyre::eyre!("bad proof artifact magic"));
     }
@@ -181,19 +182,14 @@ fn verify_proof_artifact(file: &ProofFile) -> eyre::Result<(u32, u32, [u8; 32])>
         )
         .with_context(|| "user public values verification failed")?;
 
-    // Parse the revealed values: each field element carries one BYTE of
-    // the public-values space (canonical u32 = byte value); layout matches
-    // the execution path: ptr@0, size@4, hash@8..40, little-endian.
+    // The verdict value: public values are byte-per-element, verdict is a
+    // little-endian u32 at byte 0.
     let pvs = &file.proof.user_public_values.public_values;
-    if pvs.len() < PV_HASH_OFF + PV_HASH_LEN {
+    if pvs.len() < PV_VERDICT_OFF + 4 {
         return Err(eyre::eyre!("public values too short"));
     }
     let bytes: Vec<u8> = pvs.iter().map(|e| e.as_canonical_u32() as u8).collect();
-    let ptr = u32::from_le_bytes(bytes[PV_PTR_OFF..PV_PTR_OFF + 4].try_into().unwrap());
-    let size = u32::from_le_bytes(bytes[PV_SIZE_OFF..PV_SIZE_OFF + 4].try_into().unwrap());
-    let mut hash = [0u8; 32];
-    hash.copy_from_slice(&bytes[PV_HASH_OFF..PV_HASH_OFF + PV_HASH_LEN]);
-    Ok((ptr, size, hash))
+    Ok(u32::from_le_bytes(bytes[PV_VERDICT_OFF..PV_VERDICT_OFF + 4].try_into().unwrap()))
 }
 
 // ---------------------------------------------------------------------------
@@ -208,8 +204,7 @@ fn main() -> eyre::Result<()> {
         let proof_path = args
             .get(2)
             .cloned()
-            .ok_or_else(|| eyre::eyre!("usage: impulse-runner verify <proof-file> [expected-hash-hex]"))?;
-        let expected = args.get(3).cloned();
+            .ok_or_else(|| eyre::eyre!("usage: impulse-runner verify <proof-file>"))?;
 
         #[cfg(feature = "softfloat")]
         println!("[config] softfloat (rv32im)");
@@ -223,37 +218,57 @@ fn main() -> eyre::Result<()> {
         let t = Instant::now();
         let file: ProofFile =
             bincode::deserialize(&bytes).with_context(|| "failed to decode proof artifact")?;
-        let (ptr, size, hash) = verify_proof_artifact(&file)?;
+        let verdict = verify_proof_artifact(&file)?;
         let secs = t.elapsed().as_secs_f64();
 
         println!("verified:  {secs:.2}s");
-        println!(
-            "revealed:  ptr {ptr:#010x}, {size} bytes, hash {}",
-            hex::encode(hash)
-        );
-        if let Some(exp) = expected {
-            let exp = exp.to_ascii_lowercase();
-            let got = hex::encode(hash);
-            if got == exp {
-                println!("session:   MATCH — proof reproduces the recorded final state hash");
-            } else {
-                eprintln!(
-                    "session:   MISMATCH\n  recorded: {exp}\n  proof:    {got}"
-                );
-                return Err(eyre::eyre!("proof hash mismatch"));
-            }
+        if verdict == 0 {
+            println!("verdict:   0 (VALID — session verified by the proof)");
+            println!("✓ proof verified");
+            Ok(())
+        } else {
+            eprintln!("verdict:   {verdict} (INVALID — the proof proves a REJECTED session)");
+            Err(eyre::eyre!("proof verdict = {verdict}"))
         }
-        println!("✓ proof verified");
-        return Ok(());
-    }
+    } else {
 
-    let prove = args.iter().any(|a| a == "prove");
-    let elf_path = args
+    let mut input_path: Option<String> = None;
+    let mut rest: Vec<String> = Vec::new();
+    let mut skip_next = false;
+    for a in args.iter().skip(1) {
+        if skip_next {
+            input_path = Some(a.clone());
+            skip_next = false;
+        } else if a == "--input" {
+            skip_next = true;
+        } else {
+            rest.push(a.clone());
+        }
+    }
+    if skip_next {
+        return Err(eyre::eyre!("--input requires a file argument"));
+    }
+    let prove = rest.iter().any(|a| a == "prove");
+    let elf_path = rest
         .iter()
-        .skip(1)
         .find(|a| *a != "prove")
         .cloned()
         .unwrap_or_else(|| DEFAULT_ELF_PATH.to_string());
+    if let Some(p) = &input_path {
+        println!("input:    {p}");
+    }
+    let make_streams = || -> eyre::Result<Streams<F>> {
+        match &input_path {
+            Some(p) => {
+                let bytes = std::fs::read(p)
+                    .with_context(|| format!("failed to read input at {p}"))?;
+                Ok(Streams::new(vec![
+                    bytes.iter().map(|&b| F::from_u8(b)).collect::<Vec<_>>(),
+                ]))
+            }
+            None => Ok(Streams::<F>::default()),
+        }
+    };
 
     #[cfg(feature = "softfloat")]
     println!("[config] softfloat (rv32im)");
@@ -295,7 +310,7 @@ fn main() -> eyre::Result<()> {
         let prof_hook = prof.clone();
         let state = instance
             .execute_with_hook(
-                Streams::<F>::default(),
+                make_streams()?,
                 Box::new(move |info: InstructionInfo| {
                     prof_hook.lock().unwrap().on_instruction(info.pc)
                 }),
@@ -310,54 +325,23 @@ fn main() -> eyre::Result<()> {
         state
     } else {
         instance
-            .execute(Streams::<F>::default(), None)
+            .execute(make_streams()?, None)
             .with_context(|| "execution failed")?
     };
     let exec_secs = t.elapsed().as_secs_f64();
     println!("execution:   {exec_secs:.2}s");
 
-    // 5. Read public values: ptr, size, hash.
+    // 5. Read the guest's verdict: the single public output value.
     let pvs: &[u8] =
         unsafe { state.memory.get_slice::<u8>(3, 0, NUM_PUBLIC_VALUES) };
-    let ptr = u32::from_le_bytes(
-        pvs[PV_PTR_OFF..PV_PTR_OFF + 4].try_into().expect("ptr"),
+    let verdict = u32::from_le_bytes(
+        pvs[PV_VERDICT_OFF..PV_VERDICT_OFF + 4].try_into().expect("verdict"),
     );
-    let size = u32::from_le_bytes(
-        pvs[PV_SIZE_OFF..PV_SIZE_OFF + 4].try_into().expect("size"),
-    );
-    let revealed_hash = &pvs[PV_HASH_OFF..PV_HASH_OFF + PV_HASH_LEN];
-
-    println!(
-        "guest:      state blob at AS2 {ptr:#010x}, {size} bytes, hash {}",
-        hex::encode(revealed_hash)
-    );
-
-    // 6. Read the state blob bytes out of AS 2.
-    if size == 0 || ptr == 0 {
-        return Err(eyre::eyre!(
-            "guest did not populate public values (ptr={ptr}, size={size})"
-        ));
-    }
-    let blob: &[u8] =
-        unsafe { state.memory.get_slice::<u8>(2, ptr, size as usize) };
-
-    std::fs::write(STATE_OUT, blob)
-        .with_context(|| format!("failed to write {STATE_OUT}"))?;
-    println!("wrote:      {STATE_OUT} ({size} bytes)");
-
-    // 7. Verify host SHA-256 matches the revealed hash.
-    let mut hasher = Sha256::new();
-    hasher.update(blob);
-    let computed = hasher.finalize();
-    if computed.as_slice() == revealed_hash {
-        println!("sha256:     matches");
+    if verdict == 0 {
+        println!("guest:      verdict = 0 (VALID)");
     } else {
-        eprintln!(
-            "sha256:     MISMATCH\n  revealed: {}\n  computed: {}",
-            hex::encode(revealed_hash),
-            hex::encode(computed),
-        );
-        return Err(eyre::eyre!("hash mismatch"));
+        eprintln!("guest:      verdict = {verdict} (INVALID)");
+        return Err(eyre::eyre!("guest verdict = {verdict}"));
     }
 
     // 8. Prove, persist the artifact, and verify it via the standalone path.
@@ -365,7 +349,7 @@ fn main() -> eyre::Result<()> {
         println!("\n=== Proving (this may take a while) ===");
         let t = Instant::now();
 
-        let file = prove_guest(exe.clone())?;
+        let file = prove_guest(exe.clone(), make_streams()?)?;
         let prove_secs = t.elapsed().as_secs_f64();
 
         let artifact_path = format!("{elf_path}.proof");
@@ -383,11 +367,11 @@ fn main() -> eyre::Result<()> {
         let t = Instant::now();
         let reloaded: ProofFile = bincode::deserialize(&bytes)
             .with_context(|| "failed to reload proof artifact")?;
-        let (v_ptr, v_size, v_hash) = verify_proof_artifact(&reloaded)?;
+        let proof_verdict = verify_proof_artifact(&reloaded)?;
         let verify_secs = t.elapsed().as_secs_f64();
-        if v_ptr != ptr || v_size != size || v_hash[..] != revealed_hash[..] {
+        if proof_verdict != verdict {
             return Err(eyre::eyre!(
-                "standalone verification public values differ from execution"
+                "standalone verification verdict differs from execution"
             ));
         }
 
@@ -411,7 +395,8 @@ fn main() -> eyre::Result<()> {
         );
     }
 
-    Ok(())
+        Ok(())
+    }
 }
 
 /// Build the transpiler with extensions appropriate for the active feature.

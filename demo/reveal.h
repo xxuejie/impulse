@@ -25,7 +25,7 @@
 // Copies the state blob into the carve region, hashes it with the sha256
 // custom instruction and reveals (ptr, size, hash). Returns the hash via
 // outHash so callers can cross-check it against demo/sha256.h.
-static void impulse_reveal(const void* inData, uint32_t inSize, unsigned char outHash[32])
+static inline void impulse_reveal(const void* inData, uint32_t inSize, unsigned char outHash[32])
 {
 	openvm_sha256((const uint8_t*)inData, inSize, outHash);
 
@@ -47,7 +47,7 @@ static void impulse_reveal(const void* inData, uint32_t inSize, unsigned char ou
 
 // Native reference build: no reveal, just compute the hash so it can be
 // compared against the VM run.
-static void impulse_reveal(const void* inData, uint32_t inSize, unsigned char outHash[32])
+static inline void impulse_reveal(const void* inData, uint32_t inSize, unsigned char outHash[32])
 {
 	impulse_sha256((const unsigned char*)inData, inSize, outHash);
 }
