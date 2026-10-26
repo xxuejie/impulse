@@ -57,12 +57,14 @@ docs/                 libcxx-comparison.md, future.md (proving economics study)
 
 ## Usage
 
-Requires GNU make, a POSIX sh, clang/LLVM, python3, a recent Rust
-toolchain, and GLFW for the demo window (apt `libglfw3-dev` /
-brew `glfw` / MSYS2 or vcpkg `glfw3`). The recorder/replayer
-(`demo-play`, `demo-replay`, `demo-auto`) builds on Linux, macOS and
-Windows (MSYS2 shell); the zkVM leg (`demo-verify`, `demo-prove`) is
-Linux-shaped (shell-driven dep builds — WSL on Windows). Then:
+Requires GNU make, a POSIX sh, and GLFW for the demo window (apt
+`libglfw3-dev` / brew `glfw` / MSYS2 or vcpkg `glfw3`). The
+recorder/replayer (`demo-play`, `demo-replay`, `demo-auto`) needs
+nothing else — native toolchain only, builds on Linux, macOS
+(CI-verified, incl. Apple Silicon) and Windows (MSYS2 shell). The
+zkVM leg (`demo-verify`, `demo-prove`) additionally needs clang/LLVM,
+python3, Rust and builds the cross deps — Linux-shaped (WSL on
+Windows). Then:
 
 ```sh
 git submodule update --init --recursive

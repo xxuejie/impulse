@@ -34,6 +34,27 @@ jobs:
           grep -q "replayed final hash: $(cat tests/golden-hash.txt)" replay.log
           grep -q "MATCH — replay reproduces" replay.log
 
+  # macOS/Windows guarantee: the recorder/replayer targets must build
+  # with NATIVE tooling only (no LLVM/binutils extras, no cross deps).
+  # Also doubles as the arm64 determinism leg: the golden session
+  # recorded on x86-64 Linux must replay to the same hash on Apple
+  # Silicon.
+  native-golden-mac:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install GLFW
+        run: brew install glfw
+      - name: Build native playground (GUI app only)
+        run: make build-native-playground
+      - name: Golden session headless replay
+        run: |
+          ./build/playground_native --replay tests/golden-session.bin --headless | tee replay.log
+          grep -q "replayed final hash: $(cat tests/golden-hash.txt)" replay.log
+          grep -q "MATCH — replay reproduces" replay.log
+
   # Full guest round trip: cross deps (cached ~30-45 min cold) + runner +
   # VM replay of the golden session. Proving is NOT run in CI (RAM).
   # Toolchain matches the dev box (clang 22) — the pinned libc++ sources

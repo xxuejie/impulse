@@ -10,7 +10,10 @@ CLANGXX := $(subst clang,clang++,$(CLANG))
 LD := $(call llvm_tool,ld.lld)
 OBJCOPY := $(call llvm_tool,llvm-objcopy)
 OBJDUMP := $(call llvm_tool,llvm-objdump)
-AR := $(call llvm_tool,llvm-ar)
+# llvm-ar everywhere it exists; plain `ar` as the last resort (stock
+# macOS has no llvm tools in PATH — fine for the NATIVE-only builds,
+# which is all macOS/Windows targets need)
+AR := $(or $(call llvm_tool,llvm-ar),ar)
 
 JOLT := $(abspath extern/JoltPhysics)
 MUSL := $(abspath deps/musl)
@@ -360,6 +363,7 @@ endif
 JOLT_PG_NATIVE_CXXFLAGS := $(JOLT_NATIVE_CXXFLAGS) -I $(JOLT)/PerformanceTest
 
 build-native-playground: build/libJolt_native.a
+	@echo "impulse: building the native playground (Jolt + GLFW viewer) — one-time, ~2 min"
 	$(CLANGXX) $(JOLT_PG_NATIVE_CXXFLAGS) $(GLFW_CFLAGS) demo/playground.cpp build/libJolt_native.a -o build/playground_native $(GLFW_LIBS)
 
 demo-play: build-native-playground
