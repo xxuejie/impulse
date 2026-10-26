@@ -355,7 +355,9 @@ DEMO_OUT := build/session.bin
 GLFW_CFLAGS := $(shell pkg-config --cflags glfw3 2>/dev/null)
 GLFW_PC_LIBS := $(shell pkg-config --libs glfw3 2>/dev/null)
 ifeq ($(shell uname),Darwin)
-	GLFW_LIBS := $(if $(GLFW_PC_LIBS),$(GLFW_PC_LIBS),-lglfw -framework OpenGL -framework Cocoa -framework IOKit -framework CoreVideo)
+	# glfw3.pc keeps the frameworks in Requires.private — link them ourselves
+	# (duplicate -framework flags are harmless)
+	GLFW_LIBS := $(if $(GLFW_PC_LIBS),$(GLFW_PC_LIBS),-lglfw) -framework OpenGL -framework Cocoa -framework IOKit -framework CoreVideo
 else
 	# glfw3.pc keeps libGL in Requires.private — link it ourselves
 	GLFW_LIBS := $(if $(GLFW_PC_LIBS),$(GLFW_PC_LIBS),-lglfw) -lGL
